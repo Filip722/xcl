@@ -469,14 +469,17 @@ impl Pages {
                 let a = first + i * PAGE;
                 follows.push(a);
                 let shared = self.pages.get(&a).is_some_and(|p| p.users > 0);
-                let f = self.follow.entry(a).or_insert(Follow { users: Vec::new(), mapped: false });
+                // New aliases inherit the current mapping. A pending backing update
+                // will map or unmap all the aliases together at the next submission.
+                let f = self.follow.entry(a).or_insert_with(|| Follow {
+                    users: Vec::new(),
+                    mapped: shared || title_backed(a),
+                });
                 f.users.push((key, i as u32));
-                // nothing of the title's there (and no texture maps it): left unmapped
-                if !(f.mapped || shared || title_backed(a)) {
+                if !f.mapped {
                     tiles.push(None);
                     continue;
                 }
-                f.mapped = true;
             }
             let tile = if i < own {
                 let a = first + i * PAGE;
@@ -1002,6 +1005,112 @@ mod tests {
         assert_eq!(update_ranges(7, none, map), [(skip, 0, 2), (none, 7, 2), (skip, 0, 1), (none, 1, 1), (skip, 0, 1)]);
         // tiles 0, 1 and 4 unmapped
         assert_eq!(update_ranges(5, null, |i| [0, 1, 4].contains(&i).then_some(0)), [(null, 0, 2), (skip, 0, 2), (null, 0, 1)]);
+    }
+
+    #[test]
+    fn reserved_texture_follows_pending_commit_when_an_alias_is_placed() {
+        use crate::hle::kernelx;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::{Common::*, *};
+        use windows_sys::Win32::System::Memory as mem;
+
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        let skip = crate::gpu::recomp::runner::skip_test;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return skip("D3D12 adapter unavailable") };
+            if adapter.GetDesc1().unwrap().Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                return skip("requires hardware tiled resources");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev else { return skip("D3D12 device unavailable") };
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut options as *mut _ as *mut c_void, std::mem::size_of_val(&options) as u32).is_err()
+                || options.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0
+            {
+                return skip("tiled-resources tier 2 unavailable");
+            }
+            let sample = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+            let texture = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 128, Height: 128, DepthOrArraySize: 1, MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: sample, ..Default::default()
+            };
+            let addr = kernelx::test_reserve_watched_graphics(PAGE);
+            assert!(!addr.is_null() && kernelx::in_graphics_reservation(addr as usize));
+            struct Reservation(*mut c_void);
+            impl Drop for Reservation {
+                fn drop(&mut self) {
+                    unsafe { kernelx::VirtualFree(self.0, 0, mem::MEM_RELEASE) };
+                }
+            }
+            let _reservation = Reservation(addr);
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let make_target = || {
+                let mut raw = std::ptr::null_mut();
+                let hr = place_pages(dev.as_raw(), addr as usize, &texture, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32, std::ptr::null(), Some(PAGE as u64), riid, &mut raw);
+                assert!(hr.is_some_and(|hr| hr >= 0) && !raw.is_null(), "place tiled texture: {hr:?}");
+                ID3D12Resource::from_raw(raw)
+            };
+            let target = make_target();
+            let mut tile_count = 0;
+            dev.GetResourceTiling(&target, Some(&mut tile_count), None, None, None, 0, std::ptr::null_mut());
+            assert_eq!(tile_count, 1);
+
+            let buffer = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: PAGE as u64,
+                Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+                SampleDesc: sample, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default()
+            };
+            let make_buffer = |ty, state| {
+                let mut out: Option<ID3D12Resource> = None;
+                let heap = D3D12_HEAP_PROPERTIES { Type: ty, ..Default::default() };
+                dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, state, None, &mut out).unwrap();
+                out.unwrap()
+            };
+            let upload = make_buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let readback = make_buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+            let mut bytes = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut bytes)).unwrap();
+            bytes.cast::<u8>().write_bytes(0xA5, PAGE);
+            upload.Unmap(0, None);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
+            let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, ..Default::default() };
+            let barrier = |from, to| {
+                let transition = D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(&target), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, StateBefore: from, StateAfter: to };
+                D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(transition) }, ..Default::default() }
+            };
+            let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            let dest = D3D12_RESOURCE_STATE_COPY_DEST;
+            let check = |seq, expected| {
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                list.ResourceBarrier(&[barrier(source, dest)]);
+                list.CopyTiles(&target, &coord, &region, &upload, 0, D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+                list.ResourceBarrier(&[barrier(dest, source)]);
+                list.CopyTiles(&target, &coord, &region, &readback, 0, D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+                list.Close().unwrap();
+                before_execute(&queue);
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                queue.Signal(&fence, seq).unwrap();
+                crate::gpu::fence::wait(&fence, seq, &dev, None, 5_000).unwrap();
+                let mut p = std::ptr::null_mut();
+                readback.Map(0, None, Some(&mut p)).unwrap();
+                let mismatch = std::slice::from_raw_parts(p.cast::<u8>(), PAGE).iter().copied().enumerate().find(|&(_, byte)| byte != expected);
+                readback.Unmap(0, None);
+                assert_eq!(mismatch, None, "step {seq}: expected each tile byte to be {expected:#x}");
+            };
+            check(1, 0);
+            assert_eq!(kernelx::VirtualAlloc(addr, PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE), addr);
+            // The first placement must also receive the pending commit if an alias is created
+            // between the commit and the next submit.
+            let _alias = make_target();
+            check(2, 0xA5);
+        }
     }
 
     /// Any 64 KiB page boundary inside `[va, va + bytes)` belongs to that range alone, so

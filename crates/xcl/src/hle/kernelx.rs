@@ -367,6 +367,11 @@ unsafe fn reserve_watched(size: usize, t: u32, p: u32) -> *mut c_void {
     q
 }
 
+#[cfg(test)]
+pub(crate) unsafe fn test_reserve_watched_graphics(size: usize) -> *mut c_void {
+    reserve_watched(size, mem::MEM_RESERVE | MEM_GRAPHICS, mem::PAGE_READWRITE)
+}
+
 /// PAGE_GRAPHICS_NOACCESS … PAGE_GRAPHICS_NOCACHE (0x800 – 0x40000): the console's protection of
 /// GPU-visible memory
 const PAGE_GRAPHICS_ANY: u32 = 0x7_F800;
