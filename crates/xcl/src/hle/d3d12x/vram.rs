@@ -59,7 +59,23 @@ impl<H: Clone> Arenas<H> {
 
     /// Arenas no resource used for `IDLE` go (their heap with the last reference).
     fn sweep(&mut self, now: std::time::Instant) {
-        self.list.retain(|a| a.users > 0 || a.idle_since.is_none_or(|t| now.duration_since(t) < IDLE));
+        let _ = self.sweep_dropped(now);
+    }
+
+    /// Like `sweep`, returning expired heaps so callers can drop them outside `ARENAS.lock()`.
+    fn sweep_dropped(&mut self, now: std::time::Instant) -> Vec<H> {
+        let mut dropped = Vec::new();
+        let mut i = 0;
+        while i < self.list.len() {
+            let expired = self.list[i].users == 0
+                && self.list[i].idle_since.is_some_and(|t| now.duration_since(t) >= IDLE);
+            if expired {
+                dropped.push(self.list.swap_remove(i).heap);
+            } else {
+                i += 1;
+            }
+        }
+        dropped
     }
 
     /// Where a placement of `bytes` at `va` (alignment `align`) goes: the newest arena holding
@@ -247,12 +263,41 @@ impl TilePool {
         }
     }
 
-    fn add_heap(&mut self, pool_pages: u32) -> u32 {
-        let h = self.free_by_heap.len() as u32;
-        self.free_by_heap.push((0..pool_pages).rev().collect());
-        self.dirty_sort.push(false);
+    fn add_heap_at(&mut self, slot: u32, pool_pages: u32) {
+        let idx = slot as usize;
+        if idx >= self.free_by_heap.len() {
+            self.free_by_heap.resize_with(idx + 1, Vec::new);
+            self.dirty_sort.resize(idx + 1, false);
+        }
+        debug_assert!(self.free_by_heap[idx].is_empty());
+        self.free_by_heap[idx] = (0..pool_pages).rev().collect();
+        self.dirty_sort[idx] = false;
         self.free_total += pool_pages as usize;
-        h
+    }
+
+    /// Reclaim completely empty cooled heaps (`free_by_heap[h].len() == pool_pages`), keeping up
+    /// to `keep_spare` empty heaps warm so steady-state streaming never thrashes `CreateHeap`.
+    /// Returns the reclaimed heap indices so the caller can drop their `ID3D12Heap`s.
+    fn reclaim_empty_heaps(&mut self, keep_spare: usize, pool_pages: u32) -> Vec<u32> {
+        let full = pool_pages as usize;
+        let mut empty: Vec<usize> = self
+            .free_by_heap
+            .iter()
+            .enumerate()
+            .filter_map(|(h, tiles)| (tiles.len() == full).then_some(h))
+            .collect();
+        if empty.len() <= keep_spare {
+            return Vec::new();
+        }
+        let mut reclaimed = Vec::with_capacity(empty.len() - keep_spare);
+        for h in empty.drain(keep_spare..) {
+            self.free_by_heap[h].clear();
+            self.free_by_heap[h].shrink_to_fit();
+            self.dirty_sort[h] = false;
+            self.free_total -= full;
+            reclaimed.push(h as u32);
+        }
+        reclaimed
     }
 
     fn push_cooling(&mut self, tile: Tile, now: std::time::Instant) {
@@ -341,9 +386,8 @@ impl TilePool {
                         self.return_tiles(&out);
                         return None;
                     };
-                    let added = self.add_heap(pool_pages);
-                    debug_assert_eq!(added, new_h);
-                    added as usize
+                    self.add_heap_at(new_h, pool_pages);
+                    new_h as usize
                 }
             };
             if self.dirty_sort[h] {
@@ -379,13 +423,68 @@ unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
     heap
 }
 
+/// Backing 64 MiB default heaps for `Pages`, supporting slot reuse when completely empty heaps
+/// are reclaimed back to local VRAM. `len()` reports the count of live heaps.
+struct PoolHeaps {
+    slots: Vec<Option<ID3D12Heap>>,
+    free_slots: Vec<u32>,
+    live: usize,
+}
+
+impl PoolHeaps {
+    fn new() -> Self {
+        Self { slots: Vec::new(), free_slots: Vec::new(), live: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.live
+    }
+
+    fn push_heap(&mut self, heap: ID3D12Heap) -> u32 {
+        self.live += 1;
+        if let Some(idx) = self.free_slots.pop() {
+            debug_assert!(self.slots[idx as usize].is_none());
+            self.slots[idx as usize] = Some(heap);
+            idx
+        } else {
+            let idx = self.slots.len() as u32;
+            self.slots.push(Some(heap));
+            idx
+        }
+    }
+
+    fn take_heap(&mut self, idx: u32) -> Option<ID3D12Heap> {
+        let h = self.slots.get_mut(idx as usize)?.take()?;
+        self.live -= 1;
+        self.free_slots.push(idx);
+        Some(h)
+    }
+}
+
+impl std::ops::Index<usize> for PoolHeaps {
+    type Output = ID3D12Heap;
+    fn index(&self, idx: usize) -> &Self::Output {
+        self.slots[idx].as_ref().expect("live VRAM pool heap")
+    }
+}
+
+fn keep_spare_pools() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("XCL_VRAM_KEEP_SPARE_POOLS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+    })
+}
+
 /// The title's pages of video memory for tiled textures (see the module's comment).
 struct Pages {
     queue: ID3D12CommandQueue,
     /// signalled after each mapping; title queues wait for it before their next work
     fence: ID3D12Fence,
     value: u64,
-    pools: Vec<ID3D12Heap>,
+    pools: PoolHeaps,
     pool: TilePool,
     /// title page address → its video memory
     pages: std::collections::HashMap<usize, Page>,
@@ -430,7 +529,7 @@ impl Pages {
             queue,
             fence,
             value: 0,
-            pools: Vec::new(),
+            pools: PoolHeaps::new(),
             pool: TilePool::new(),
             pages: std::collections::HashMap::new(),
             extra_pages: std::collections::HashMap::new(),
@@ -448,6 +547,30 @@ impl Pages {
     /// Pages no resource used for `IDLE` go back to the pools.
     fn sweep(&mut self, now: std::time::Instant) {
         sweep_idle(&mut self.idle, &mut self.pages, &mut self.extra_pages, &mut self.pool.cooling, now);
+    }
+
+    /// Sweep expired idle pages, drain cooled tiles, and reclaim any completely empty 64 MiB
+    /// pool heaps (above the warm spare count), returning their `ID3D12Heap`s to be dropped
+    /// outside `PAGES.lock()`.
+    fn sweep_and_reclaim(&mut self, now: std::time::Instant) -> Vec<ID3D12Heap> {
+        self.sweep(now);
+        self.pool.drain_cooling(now);
+        let reclaimed_ids = self.pool.reclaim_empty_heaps(keep_spare_pools(), POOL_PAGES);
+        let mut dropped = Vec::with_capacity(reclaimed_ids.len());
+        for idx in reclaimed_ids {
+            if let Some(h) = self.pools.take_heap(idx) {
+                dropped.push(h);
+            }
+        }
+        if !dropped.is_empty() {
+            let mb = (dropped.len() * POOL_PAGES as usize * PAGE) >> 20;
+            crate::xlog_info!(
+                "D3D12.X: reclaimed {} empty 64 MiB VRAM pool heap(s) ({mb} MiB returned to GPU; {} pools active)",
+                dropped.len(),
+                self.pools.len()
+            );
+        }
+        dropped
     }
 
     /// Map every tile of `res` (`tiles[i]`: overall tile i) – one call per pool heap.
@@ -577,8 +700,7 @@ impl Pages {
         let pool = &mut self.pool;
         let fresh = pool.take_batch(missing, preferred, now, POOL_PAGES, || {
             let heap = alloc_pool_heap(dev)?;
-            pools.push(heap);
-            Some(pools.len() as u32 - 1)
+            Some(pools.push_heap(heap))
         })?;
         let mut fresh_iter = fresh.into_iter();
 
@@ -694,6 +816,13 @@ unsafe fn reservable(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> bool {
     can_reserve(f.Support2.0, samples, m.NumQualityLevels)
 }
 
+/// Canonical physical-backing address for `va`: when `va` lies inside a GPU mirror view of title
+/// CPU memory (`kernelx::mirrors::source`), map both views to the same backing address so shared
+/// 64 KiB VRAM pages and arenas alias instead of duplicating video memory.
+fn canonical_va(va: usize) -> usize {
+    crate::hle::kernelx::mirrors::source(va).unwrap_or(va)
+}
+
 /// A texture at `va` as a reserved resource on the title's shared 64 KiB pages
 /// (`console_bytes`: its size on the console; tiles past the owned page boundaries are shared by
 /// `(va, tile_index)` so repeated placements at the same address do not leak). None: it cannot be.
@@ -710,6 +839,7 @@ unsafe fn place_on_pages(
     riid: *const windows_sys::core::GUID,
     ppv: *mut *mut c_void,
 ) -> Option<HRESULT> {
+    let va = canonical_va(va);
     if desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D {
         return None;
     }
@@ -828,19 +958,46 @@ fn forget_pages(resource: usize) {
     }
 }
 
-/// Before GPU work on `queue`: have it wait for every tile mapping made so far on its device.
+/// Before GPU work on `queue`: have it wait for every tile mapping made so far on its device,
+/// and periodically (once per second) reclaim completely empty 64 MiB VRAM pool heaps and idle
+/// arenas so unused streaming memory returns to fast local VRAM even during quiet world frames.
 pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let mut dev: Option<ID3D12Device> = None;
     if queue.GetDevice(&mut dev).is_err() {
         return;
     }
     let Some(dev) = dev else { return };
-    let mut g = PAGES.lock().unwrap();
-    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return };
-    let key = queue.as_raw() as usize;
-    if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
-        let _ = queue.Wait(&pages.fence, pages.value);
-        pages.waited.insert(key, pages.value);
+    let dev_key = dev.as_raw() as usize;
+    let should_reclaim = {
+        static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now_ms = T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+        let prev = LAST_MS.load(std::sync::atomic::Ordering::Relaxed);
+        now_ms.saturating_sub(prev) >= 1000
+            && LAST_MS
+                .compare_exchange(prev, now_ms, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed)
+                .is_ok()
+    };
+    let mut dropped_pools = Vec::new();
+    {
+        let mut g = PAGES.lock().unwrap();
+        if let Some(Some(pages)) = g.get_mut(&dev_key) {
+            let key = queue.as_raw() as usize;
+            if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
+                let _ = queue.Wait(&pages.fence, pages.value);
+                pages.waited.insert(key, pages.value);
+            }
+            if should_reclaim {
+                dropped_pools = pages.sweep_and_reclaim(std::time::Instant::now());
+            }
+        }
+    }
+    // Drop reclaimed 64 MiB heaps and idle arenas outside their locks so D3D12 Release never
+    // blocks concurrent texture placement threads.
+    drop(dropped_pools);
+    if should_reclaim {
+        let dropped_arenas = ARENAS.lock().unwrap().sweep_dropped(std::time::Instant::now());
+        drop(dropped_arenas);
     }
 }
 
@@ -894,6 +1051,7 @@ pub unsafe fn place_pages(
 /// neither – the caller makes a resource of its own).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, clear: *const c_void, console_bytes: Option<u64>, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    let va = canonical_va(va);
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
     if !tier2(dev) {
         return None;
@@ -1003,6 +1161,79 @@ mod tests {
         let fail = pool.take_batch(16, None, t2, P, || None);
         assert!(fail.is_none());
         assert_eq!(pool.free_total, 8, "OOM rollback must return all popped tiles");
+    }
+
+    /// Empty cooled pool heaps (above the warm spare count) are reclaimed cleanly back to VRAM and
+    /// their slot indices can be reused without growing the heap table.
+    #[test]
+    fn tile_pool_reclaims_empty_heaps_keeping_warm_spare_and_reuses_slots() {
+        let t0 = Instant::now();
+        let mut pool = TilePool::new();
+        let free_slots: std::cell::RefCell<Vec<u32>> = std::cell::RefCell::new(Vec::new());
+        let next_slot = std::cell::Cell::new(0u32);
+        let mut alloc_slot = || {
+            free_slots.borrow_mut().pop().or_else(|| {
+                let h = next_slot.get();
+                next_slot.set(h + 1);
+                Some(h)
+            })
+        };
+
+        const P: u32 = 64;
+        let h0 = pool.take_batch(P as usize, None, t0, P, &mut alloc_slot).unwrap();
+        let h1 = pool.take_batch(P as usize, None, t0, P, &mut alloc_slot).unwrap();
+        let h2 = pool.take_batch(P as usize, None, t0, P, &mut alloc_slot).unwrap();
+        let h3 = pool.take_batch(P as usize, None, t0, P, &mut alloc_slot).unwrap();
+        assert_eq!(next_slot.get(), 4);
+        assert_eq!(pool.free_total, 0);
+
+        // Keep 1 tile live in heap 0; free all tiles in heaps 1, 2, 3.
+        for &tile in &h0[1..] {
+            pool.push_cooling(tile, t0);
+        }
+        for batch in [&h1, &h2, &h3] {
+            for &tile in batch {
+                pool.push_cooling(tile, t0);
+            }
+        }
+        let t1 = t0 + COOL + Duration::from_millis(1);
+        pool.drain_cooling(t1);
+        assert_eq!(pool.free_total, 63 + 64 * 3);
+
+        // Reclaim empty heaps keeping 1 warm spare: heaps 2 and 3 reclaim, heap 1 stays warm,
+        // heap 0 still has 1 live tile so it is untouched.
+        let reclaimed = pool.reclaim_empty_heaps(1, P);
+        assert_eq!(reclaimed, vec![2, 3]);
+        assert_eq!(pool.free_total, 63 + 64);
+        free_slots.borrow_mut().extend(reclaimed);
+
+        // First 64-tile allocation reuses warm spare heap 1 (no new heap allocated).
+        let reuse_spare = pool.take_batch(P as usize, None, t1, P, &mut alloc_slot).unwrap();
+        assert!(reuse_spare.iter().all(|&(h, _)| h == 1));
+        assert_eq!(free_slots.borrow().len(), 2);
+
+        // Next 64-tile allocation consumes heap 0's 63 free tiles plus 1 tile from reclaimed slot 3
+        // without advancing `next_slot`.
+        let reuse_slot = pool.take_batch(P as usize, None, t1, P, &mut alloc_slot).unwrap();
+        assert_eq!(reuse_slot.iter().filter(|&&(h, _)| h == 0).count(), 63);
+        assert_eq!(reuse_slot.iter().filter(|&&(h, _)| h == 3).count(), 1);
+        assert_eq!(next_slot.get(), 4);
+        assert_eq!(free_slots.borrow().len(), 1);
+    }
+
+    #[test]
+    fn arenas_sweep_dropped_returns_expired_heaps() {
+        let t0 = Instant::now();
+        let mut arenas: Arenas<u32> = Arenas::new();
+        let (_, _, id1) = arenas.take(0x10_0000, 0x1_0000, PAGE, t0, |_, _| Some(101)).unwrap();
+        let (_, _, id2) = arenas.take(0x20_0000, 0x1_0000, PAGE, t0, |_, _| Some(202)).unwrap();
+        arenas.release(id1, t0);
+        arenas.release(id2, t0 + Duration::from_secs(1));
+        assert!(arenas.sweep_dropped(t0 + Duration::from_millis(1900)).is_empty());
+        assert_eq!(arenas.sweep_dropped(t0 + IDLE + Duration::from_millis(10)), vec![101]);
+        assert_eq!(arenas.bytes(), 0x1_0000);
+        assert_eq!(arenas.sweep_dropped(t0 + Duration::from_secs(1) + IDLE + Duration::from_millis(10)), vec![202]);
+        assert_eq!(arenas.bytes(), 0);
     }
 
     /// Idle pages go back after `IDLE`, and a sweep looks at the queue of idle pages alone: one
