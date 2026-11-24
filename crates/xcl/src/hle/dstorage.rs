@@ -993,9 +993,41 @@ enum Entry {
     Gate(Arc<std::sync::Barrier>),
 }
 
+impl Entry {
+    fn has_late_destination(&self) -> bool {
+        matches!(self, Self::Request { dest_pages: Some(pages), .. } if pages.contains(&0))
+    }
+}
+
 struct Pending {
     entries: Vec<Entry>,
     next_seq: u64,
+    /// Requests whose destination page array had a zero at enqueue.
+    late: usize,
+}
+
+impl Pending {
+    fn ready_for_auto_submit(&self, capacity: usize) -> bool {
+        self.late == 0 && self.entries.len() >= (capacity / 2).max(1)
+    }
+}
+
+/// The title's Submit can fill missing pages while its array is still live. Keep the original
+/// snapshot for entries that already had a page.
+unsafe fn refill_late_pages(entries: &mut [Entry]) {
+    for entry in entries {
+        let Entry::Request { req, dest_pages: Some(pages), .. } = entry else { continue };
+        if !pages.contains(&0) {
+            continue;
+        }
+        if let Ok(current) = snapshot_page_array(req.destination, req.destination_page_offset, req.destination_size) {
+            for (page, updated) in pages.iter_mut().zip(current) {
+                if *page == 0 {
+                    *page = updated;
+                }
+            }
+        }
+    }
 }
 
 struct CancelRule {
@@ -1046,14 +1078,26 @@ impl QueueInner {
         rules.iter().any(|r| tag & r.mask == r.value)
     }
 
-    fn submit(self: &Arc<Self>) {
+    /// An explicit Submit rereads late page entries before sending the batch to the worker.
+    fn submit(self: &Arc<Self>, by_title: bool) {
         // Lock `worker` before `pending` so concurrent `Submit()` calls always enqueue
         // batches to the channel in strict `seq` order.
         let mut w = self.worker.lock().unwrap();
         if self.closed.load(Ordering::Acquire) {
             return;
         }
-        let batch = std::mem::take(&mut self.pending.lock().unwrap().entries);
+        let batch = {
+            let mut pending = self.pending.lock().unwrap();
+            // Another enqueue or submit may have changed eligibility since the caller checked.
+            if !by_title && !pending.ready_for_auto_submit(self.capacity) {
+                return;
+            }
+            if by_title && pending.late > 0 {
+                unsafe { refill_late_pages(&mut pending.entries) };
+            }
+            pending.late = 0;
+            std::mem::take(&mut pending.entries)
+        };
         if batch.is_empty() {
             return;
         }
@@ -1145,7 +1189,7 @@ impl QueueInner {
     }
 
     fn enqueue(self: &Arc<Self>, e: Entry) {
-        let n = {
+        let ready = {
             let mut p = self.pending.lock().unwrap();
             if self.closed.load(Ordering::Acquire) {
                 return;
@@ -1156,11 +1200,10 @@ impl QueueInner {
                 }
             }
             p.entries.push(e);
-            p.entries.len()
+            p.ready_for_auto_submit(self.capacity)
         };
-        // as on PC: a half-full queue submits by itself
-        if n >= (self.capacity / 2).max(1) {
-            self.submit();
+        if ready {
+            self.submit(false);
         }
     }
 
@@ -1174,18 +1217,20 @@ impl QueueInner {
     }
 
     fn enqueue_numbered(self: &Arc<Self>, entry: impl FnOnce(u64) -> Entry) {
-        let n = {
+        let ready = {
             let mut p = self.pending.lock().unwrap();
             if self.closed.load(Ordering::Acquire) {
                 return;
             }
             let seq = p.next_seq;
             p.next_seq += 1;
-            p.entries.push(entry(seq));
-            p.entries.len()
+            let entry = entry(seq);
+            p.late += usize::from(entry.has_late_destination());
+            p.entries.push(entry);
+            p.ready_for_auto_submit(self.capacity)
         };
-        if n >= (self.capacity / 2).max(1) {
-            self.submit();
+        if ready {
+            self.submit(false);
         }
     }
 }
@@ -1249,7 +1294,7 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         desc: raw,
         source_memory: source == 1,
         capacity,
-        pending: Mutex::new(Pending { entries: Vec::new(), next_seq: 1 }),
+        pending: Mutex::new(Pending { entries: Vec::new(), next_seq: 1, late: 0 }),
         cancels: Mutex::new(Vec::new()),
         worker: Mutex::new(None),
         worker_active: (Mutex::new(false), Condvar::new()),
@@ -1377,7 +1422,7 @@ unsafe extern "system" fn queue_enqueue_signal(p: *mut c_void, fence: *mut c_voi
 unsafe extern "system" fn queue_submit(p: *mut c_void) {
     let q = queue(p);
     if !q.closed.load(Ordering::Acquire) {
-        q.submit();
+        q.submit(true);
     }
 }
 
@@ -1387,7 +1432,13 @@ unsafe extern "system" fn queue_cancel(p: *mut c_void, mask: u64, value: u64) {
     let q = queue(p);
     let cutoff = {
         let mut pend = q.pending.lock().unwrap();
-        pend.entries.retain(|e| !matches!(e, Entry::Request { req, .. } | Entry::Refused { req, .. } if req.tag & mask == value));
+        let mut removed_late = 0;
+        pend.entries.retain(|entry| {
+            let cancelled = matches!(entry, Entry::Request { req, .. } | Entry::Refused { req, .. } if req.tag & mask == value);
+            removed_late += usize::from(cancelled && entry.has_late_destination());
+            !cancelled
+        });
+        pend.late -= removed_late;
         pend.next_seq.saturating_sub(1)
     };
     if cutoff == 0 {
@@ -1412,6 +1463,7 @@ unsafe extern "system" fn queue_close(p: *mut c_void) {
             Vec::new()
         } else {
             w.take();
+            pend.late = 0;
             std::mem::take(&mut pend.entries)
         }
     };
@@ -2133,6 +2185,61 @@ mod tests {
             assert_eq!(status_get_hresult(s, 3), S_OK);
             status_release(s);
         }
+    }
+
+    #[test]
+    fn a_late_page_array_defers_half_full_submission_until_cancelled() {
+        unsafe {
+            let mut desc = [0u8; 0x18];
+            desc[..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&4u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(factory_create_queue(std::ptr::null_mut(), desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let inner = queue(q);
+            let status = || Arc::new(StatusInner { slots: vec![AtomicI32::new(S_OK)].into_boxed_slice() });
+            inner.enqueue(Entry::Status(status(), 0));
+            let table = [0usize];
+            let source = [0x5au8; 16];
+            let tag = 0x11;
+            let request = request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, table.as_ptr() as u64, 0,
+                source.len() as u32, source.as_ptr() as u64, 0, source.len() as u32, 0, tag);
+            queue_enqueue_request(q, request.as_ptr());
+            let after_enqueue = inner.pending.lock().unwrap().entries.len();
+
+            // A submit caller may have observed a ready batch before this request was enqueued.
+            inner.submit(false);
+            let after_stale_submit = inner.pending.lock().unwrap().entries.len();
+            let worker_started_early = inner.worker.lock().unwrap().is_some();
+
+            queue_cancel(q, u64::MAX, tag);
+            inner.enqueue(Entry::Status(status(), 0));
+            let after_cancel_and_enqueue = inner.pending.lock().unwrap().entries.len();
+            let worker_started_after_cancel = inner.worker.lock().unwrap().is_some();
+
+            // Keep the referenced arrays live until any worker has stopped, including on failure.
+            queue_close(q);
+            queue_release(q);
+            assert_eq!(after_enqueue, 2, "the late request must hold the initial half-full batch");
+            assert_eq!(after_stale_submit, 2, "auto-submit must recheck the pending batch");
+            assert!(!worker_started_early);
+            assert_eq!(after_cancel_and_enqueue, 0, "cancelling the late request must clear the deferral");
+            assert!(worker_started_after_cancel);
+        }
+    }
+
+    #[test]
+    fn refilling_a_late_page_array_keeps_the_nonzero_snapshot_entries() {
+        let current = [11usize, 13];
+        let req = Request {
+            destination: current.as_ptr() as u64,
+            destination_size: (crate::hle::kernelx::PHYS_PAGE_SIZE + 1) as u32,
+            ..Default::default()
+        };
+        let mut entries = [Entry::Request { seq: 1, req, file: None, dest_pages: Some(vec![7, 0]), src_pages: None }];
+        unsafe { refill_late_pages(&mut entries) };
+        let Entry::Request { dest_pages: Some(pages), .. } = &entries[0] else { unreachable!() };
+        assert_eq!(pages, &[7, 13]);
     }
 
     /// A destination page array whose entry is still 0 at EnqueueRequest and gets its page
