@@ -515,18 +515,14 @@ unsafe fn direct_windows(dev: &ID3D12Device, u: &crate::gpu::uma::Uma) -> Vec<(u
             return Vec::new();
         }
     };
-    let mut out = Vec::new();
-    let mut heaps = Vec::new();
-    for k in 0..u.shader_windows() {
-        if !u.is_sparse_window(k) {
-            continue;
-        }
+    let indices = (0..u.shader_windows()).filter(|&k| u.is_sparse_window(k));
+    publish_direct_windows(indices.map(|k| {
         let (base, size) = u.window(k);
         let heap: ID3D12Heap = match dev3.OpenExistingHeapFromAddress(base as *const c_void) {
             Ok(h) => h,
             Err(e) => {
                 crate::xlog_warn!("sparse window {k}: OpenExistingHeapFromAddress: {e} – tiled instead");
-                return Vec::new();
+                return None;
             }
         };
         let mut d = buffer_desc(size as u64);
@@ -534,16 +530,24 @@ unsafe fn direct_windows(dev: &ID3D12Device, u: &crate::gpu::uma::Uma) -> Vec<(u
         let mut r: Option<ID3D12Resource> = None;
         if let Err(e) = dev.CreatePlacedResource(&heap, 0, &d, D3D12_RESOURCE_STATE_COMMON, None, &mut r) {
             crate::xlog_warn!("sparse window {k}: CreatePlacedResource: {e} – tiled instead");
-            return Vec::new();
+            return None;
         }
-        let Some(r) = r else { return Vec::new() };
+        Some((k, base, heap, r?))
+    }))
+}
+
+/// Publish the window handles together once every heap and buffer is ready.
+unsafe fn publish_direct_windows(
+    windows: impl Iterator<Item = Option<(usize, usize, ID3D12Heap, ID3D12Resource)>>,
+) -> Vec<(usize, usize, u64)> {
+    let Some(windows) = windows.collect::<Option<Vec<_>>>() else { return Vec::new() };
+    if windows.is_empty() {
+        return Vec::new();
+    }
+    let (heaps, out): (Vec<_>, Vec<_>) = windows.into_iter().map(|(k, base, heap, r)| {
         let va = r.GetGPUVirtualAddress();
-        out.push((k, r.into_raw() as usize, va));
-        heaps.push((base, heap));
-    }
-    if out.is_empty() {
-        return out;
-    }
+        ((base, heap), (k, r.into_raw() as usize, va))
+    }).unzip();
     crate::xlog_info!("D3D12.X: {} sparse window(s) hold the title's own pages: no tiles, no upload", out.len());
     *DIRECT.lock().unwrap() = heaps;
     DIRECT_ON.store(true, Ordering::Relaxed);
@@ -1748,6 +1752,71 @@ fn forget_in(s: &mut State, res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// If a later placed buffer is refused, an earlier one must release its temporary COM reference.
+    #[test]
+    fn a_refused_direct_window_releases_buffers_prepared_before_it() {
+        use windows::core::IUnknown;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
+        use windows_sys::Win32::System::SystemServices::MEM_WRITE_WATCH;
+
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                eprintln!("SKIPPED a_refused_direct_window_releases_buffers_prepared_before_it: no D3D12 device");
+                return;
+            }
+            let device = device.unwrap();
+            let Ok(dev3) = device.cast::<ID3D12Device3>() else {
+                eprintln!("SKIPPED a_refused_direct_window_releases_buffers_prepared_before_it: no ID3D12Device3");
+                return;
+            };
+            let base = VirtualAlloc(std::ptr::null(), TILE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+            assert!(!base.is_null());
+            let heap: ID3D12Heap = match dev3.OpenExistingHeapFromAddress(base) {
+                Ok(heap) => heap,
+                Err(e) => {
+                    VirtualFree(base, 0, MEM_RELEASE);
+                    eprintln!("SKIPPED a_refused_direct_window_releases_buffers_prepared_before_it: cannot import one tile: {e}");
+                    return;
+                }
+            };
+            let place = |bytes| -> windows::core::Result<ID3D12Resource> {
+                let mut desc = buffer_desc(bytes);
+                desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+                let mut buffer = None;
+                device.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)?;
+                Ok(buffer.unwrap())
+            };
+            let first = place(TILE as u64).expect("place first window");
+            let probe = first.cast::<IUnknown>().unwrap();
+            let refs = || {
+                let vt = Interface::vtable(&probe);
+                (vt.AddRef)(probe.as_raw());
+                (vt.Release)(probe.as_raw())
+            };
+            let initial = refs();
+            let extra = first.clone();
+            assert_eq!(refs(), initial + 1, "the probe observes an extra buffer reference");
+            drop(extra);
+            let mut refused = false;
+            let valid = Some((0, base as usize, heap.clone(), first.clone()));
+            let windows = std::iter::once(valid).chain(std::iter::once_with(|| {
+                // The driver must refuse a resource larger than its heap.
+                place(heap.GetDesc().SizeInBytes + TILE as u64).expect_err("second placement must fail");
+                refused = true;
+                None
+            }));
+            assert!(publish_direct_windows(windows).is_empty());
+            assert!(refused, "the first buffer must be prepared before the second fails");
+            assert_eq!(refs(), initial, "a buffer reference survived the fallback");
+            drop(probe);
+            drop(first);
+            drop(heap);
+            assert_ne!(VirtualFree(base, 0, MEM_RELEASE), 0);
+        }
+    }
 
     /// `queue()` answers while the state's lock is held: a resource's last `Release` asks for
     /// it (`late_release::drain_known`) from inside a D3D12 call that the lock's holder can be
