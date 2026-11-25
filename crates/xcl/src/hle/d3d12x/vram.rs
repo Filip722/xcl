@@ -64,18 +64,9 @@ impl<H: Clone> Arenas<H> {
 
     /// Like `sweep`, returning expired heaps so callers can drop them outside `ARENAS.lock()`.
     fn sweep_dropped(&mut self, now: std::time::Instant) -> Vec<H> {
-        let mut dropped = Vec::new();
-        let mut i = 0;
-        while i < self.list.len() {
-            let expired = self.list[i].users == 0
-                && self.list[i].idle_since.is_some_and(|t| now.duration_since(t) >= IDLE);
-            if expired {
-                dropped.push(self.list.swap_remove(i).heap);
-            } else {
-                i += 1;
-            }
-        }
-        dropped
+        self.list.extract_if(.., |a| {
+            a.users == 0 && a.idle_since.is_some_and(|t| now.duration_since(t) >= IDLE)
+        }).map(|a| a.heap).collect()
     }
 
     /// Where a placement of `bytes` at `va` (alignment `align`) goes: the newest arena holding
@@ -1386,6 +1377,20 @@ mod tests {
         assert_eq!(a.bytes(), (70 + 70 + 8) * MIB);
         // the newest arena holding an address is the one placements there share
         assert_eq!(take(&mut a, a0 + 64 * MIB, 4 * MIB, PAGE, t), straddle);
+    }
+
+    #[test]
+    fn sweeping_idle_arena_preserves_newest_overlapping_placement() {
+        let t = Instant::now();
+        let mut arenas = Arenas::new();
+        let idle = take(&mut arenas, PAGE, PAGE, PAGE, t);
+        let base = 4 * PAGE;
+        let older = take(&mut arenas, base, PAGE, PAGE, t);
+        let newest = take(&mut arenas, base, 2 * PAGE, PAGE, t);
+        assert_ne!(older, newest);
+        arenas.release(idle, t);
+
+        assert_eq!(take(&mut arenas, base, PAGE, PAGE, t + IDLE), newest);
     }
 
     #[test]
