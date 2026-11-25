@@ -1050,14 +1050,13 @@ impl Lw {
         if self.dyn_rm {
             let sd = Self::field(d, "SDST");
             let src = self.code32(sd, None, false).ok_or_else(|| format!("{}: register", rdna2::format(d)))?;
-            let sh = 2 - off;
             let v = match dp_mask {
                 3 => {
-                    let x = self.lshrc(src, sh);
+                    let x = self.lshrc(src, 2 - off);
                     self.andc(x, 3)
                 }
                 1 => {
-                    let x = self.lshrc(src, sh);
+                    let x = self.lshrc(src, 2 - off);
                     let bit = self.andc(x, 1);
                     let cur = self.rd(VAR_FP16_RM);
                     let keep = self.andc(cur, 2);
@@ -1384,20 +1383,18 @@ impl Lw {
                 let sc = self.scc();
                 let t0 = self.add(a, b);
                 let t = self.add(t0, sc);
-                let (a6, b6, s6) = (self.zext64(a), self.zext64(b), self.zext64(sc));
-                let x = self.add(a6, b6);
-                let x = self.add(x, s6);
-                let lim = self.c64(0xFFFF_FFFF);
-                let c = self.cmp(Pred::UGt, x, lim);
+                let c0 = self.cmp(Pred::ULt, t0, a);
+                let c1 = self.cmp(Pred::ULt, t, t0);
+                let c = self.lor(c0, c1);
                 (t, Scc::Is(c))
             }
             "s_subb_u32" => {
                 let sc = self.scc();
                 let t0 = self.sub(a, b);
                 let t = self.sub(t0, sc);
-                let (a6, b6, s6) = (self.zext64(a), self.zext64(b), self.zext64(sc));
-                let x = self.add(b6, s6);
-                let c = self.cmp(Pred::UGt, x, a6);
+                let c0 = self.cmp(Pred::ULt, a, b);
+                let c1 = self.cmp(Pred::ULt, t0, sc);
+                let c = self.lor(c0, c1);
                 (t, Scc::Is(c))
             }
             "s_add_i32" => {
@@ -1423,15 +1420,13 @@ impl Lw {
             "s_lshr_b32" => (self.lshr(a, b), Scc::Nz),
             "s_ashr_i32" => (self.ashr(a, b), Scc::Nz),
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
-                let k = name.as_bytes()[6] - b'0';
-                let s = self.shlc(a, k as u32);
+                let k = (name.as_bytes()[6] - b'0') as u32;
+                let s = self.shlc(a, k);
                 let t = self.add(s, b);
-                let (a6, b6) = (self.zext64(a), self.zext64(b));
-                let kk = self.c64(k as u64);
-                let x = self.bin(BinOp::Shl, a6, kk);
-                let x = self.add(x, b6);
-                let lim = self.c64(0xFFFF_FFFF);
-                let c = self.cmp(Pred::UGt, x, lim);
+                let hi = self.lshrc(a, 32 - k);
+                let c0 = self.nz(hi);
+                let c1 = self.cmp(Pred::ULt, t, b);
+                let c = self.lor(c0, c1);
                 (t, Scc::Is(c))
             }
             "s_bfm_b32" => (self.bfm(a, b), Scc::No),
