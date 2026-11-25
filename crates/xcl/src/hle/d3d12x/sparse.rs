@@ -1528,12 +1528,22 @@ pub fn mapped_ranges() -> Vec<(usize, usize)> {
 
 /// time spent and pages found by the write-watch scans (`refresh_once`), for the timing line
 static WATCH: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static WATCH_N: AtomicU64 = AtomicU64::new(0);
 /// [lock wait, chunk scan, upload] in µs, runs uploaded
 static PHASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 pub fn note_watch(t: std::time::Duration, pages: usize) {
     WATCH[0].fetch_add(t.as_micros() as u64, Ordering::Relaxed);
     WATCH[1].fetch_add(pages as u64, Ordering::Relaxed);
+    let n = WATCH_N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() && n >= 16 {
+        crate::xlog_info!(
+            "write-watch: {n} looks, {} ms total ({} dirty pages), this look {} ms",
+            WATCH[0].load(Ordering::Relaxed) / 1000,
+            WATCH[1].load(Ordering::Relaxed),
+            t.as_millis()
+        );
+    }
 }
 
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
